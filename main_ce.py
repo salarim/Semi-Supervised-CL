@@ -6,7 +6,7 @@ import argparse
 import time
 import math
 
-import tensorboard_logger as tb_logger
+from torch.utils.tensorboard import SummaryWriter
 import torch
 import torch.backends.cudnn as cudnn
 from torchvision import transforms, datasets
@@ -291,7 +291,7 @@ def main():
     optimizer = set_optimizer(opt, model)
 
     # tensorboard
-    logger = tb_logger.Logger(logdir=opt.tb_folder, flush_secs=2)
+    writer = SummaryWriter(log_dir=opt.tb_folder, flush_secs=2)
 
     # training routine
     for epoch in range(1, opt.epochs + 1):
@@ -304,14 +304,14 @@ def main():
         print('epoch {}, total time {:.2f}'.format(epoch, time2 - time1))
 
         # tensorboard logger
-        logger.log_value('train_loss', loss, epoch)
-        logger.log_value('train_acc', train_acc, epoch)
-        logger.log_value('learning_rate', optimizer.param_groups[0]['lr'], epoch)
+        writer.add_scalar('train_loss', loss, global_step=epoch)
+        writer.add_scalar('train_acc', train_acc, global_step=epoch)
+        writer.add_scalar('learning_rate', optimizer.param_groups[0]['lr'], global_step=epoch)
 
         # evaluation
         loss, val_acc = validate(val_loader, model, criterion, opt)
-        logger.log_value('val_loss', loss, epoch)
-        logger.log_value('val_acc', val_acc, epoch)
+        writer.add_scalar('val_loss', loss, global_step=epoch)
+        writer.add_scalar('val_acc', val_acc, global_step=epoch)
 
         if val_acc > best_acc:
             best_acc = val_acc
