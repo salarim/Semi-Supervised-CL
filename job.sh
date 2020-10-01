@@ -2,7 +2,7 @@
 #SBATCH --mail-user=salari.m1375@gmail.com
 #SBATCH --mail-type=ALL
 #SBATCH --account=def-mori_gpu
-#SBATCH --job-name=SSCL-SimCLR-1000e
+#SBATCH --job-name=SSCL-fully-unsup-1000e
 #SBATCH --output=%x-%j.out
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
@@ -22,7 +22,7 @@ source venv/bin/activate
 pip install --no-index --upgrade pip
 pip install --no-index -r requirements.txt
 
-python main_supcon.py \
+python main_semicl.py \
   --model resnet50 \
   --epochs 1000 \
   --batch_size 512 \
