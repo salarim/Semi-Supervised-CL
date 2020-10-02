@@ -218,7 +218,7 @@ def set_loader(opt):
                                  )
 
     train_loader = torch.utils.data.DataLoader(
-        cl_dataset, batch_size=opt.batch_size, shuffle=True,
+        cl_dataset, batch_size=opt.batch_size, shuffle=False,
         num_workers=opt.num_workers, pin_memory=True)
     
     return train_loader
