@@ -2,11 +2,11 @@
 #SBATCH --mail-user=salari.m1375@gmail.com
 #SBATCH --mail-type=ALL
 #SBATCH --account=def-mori_gpu
-#SBATCH --job-name=SSCL-cl-dataset-unsup-test
+#SBATCH --job-name=SSCL-cl-dataset-semisup-test
 #SBATCH --output=%x-%j.out
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
-#SBATCH --time=11:59:00
+#SBATCH --time=23:59:00
 #SBATCH --mem=10000M
 #SBATCH --gres=gpu:v100l:4
 #SBATCH --cpus-per-task=16
@@ -29,7 +29,7 @@ python main_semicl.py \
   --learning_rate 0.5 \
   --temp 0.5 \
   --cosine \
-  --labeled_prob 0.0 \
+  --labeled_prob 1.0 \
   --unlabeled_prob 1.0
 
 python main_linear.py \
