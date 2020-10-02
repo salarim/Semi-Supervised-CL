@@ -5,6 +5,7 @@ import sys
 import argparse
 import time
 import math
+import numpy as np
 
 from torch.utils.tensorboard import SummaryWriter
 import torch
@@ -15,8 +16,11 @@ from torchvision import transforms, datasets
 from util import TwoCropTransform, AverageMeter
 from util import adjust_learning_rate, warmup_learning_rate
 from util import save_model
+from main_ce import set_loader as set_val_loader
+from main_linear import validate
 from networks.resnet_big import SupConResNet, LinearClassifier
 from losses import SupConLoss
+from continual_dataset import ClassIncremental, ContinualDataset
 
 try:
     import apex
@@ -32,6 +36,8 @@ def parse_option():
                         help='print frequency')
     parser.add_argument('--save_freq', type=int, default=50,
                         help='save frequency')
+    parser.add_argument('--val_freq', type=int, default=50,
+                        help='validation frequency')
     parser.add_argument('--batch_size', type=int, default=256,
                         help='batch_size')
     parser.add_argument('--num_workers', type=int, default=16,
@@ -59,6 +65,14 @@ def parse_option():
     parser.add_argument('--std', type=str, help='std of dataset in path in form of str tuple')
     parser.add_argument('--data_folder', type=str, default=None, help='path to custom dataset')
     parser.add_argument('--size', type=int, default=32, help='parameter for RandomResizedCrop')
+
+    # continual dataset
+    parser.add_argument('--nb_tasks', type=int, default=5, 
+                        help='Number of tasks for ClassIncremental dataset')
+    parser.add_argument('--unlabeled_prob', type=float, default=1.0, 
+                        help='Probability of unlabeled data in dataset')
+    parser.add_argument('--labeled_prob', type=float, default=0.0, 
+                        help='Probability of labeled data in dataset')
 
     # method
     parser.add_argument('--method', type=str, default='SupCon',
@@ -97,9 +111,10 @@ def parse_option():
     for it in iterations:
         opt.lr_decay_epochs.append(int(it))
 
-    opt.model_name = '{}_{}_{}_lr_{}_decay_{}_bsz_{}_temp_{}_trial_{}'.\
+    opt.model_name = '{}_{}_{}_lr_{}_decay_{}_bsz_{}_temp_{}_lprob_{}_unlprob_{}_trial_{}'.\
         format(opt.method, opt.dataset, opt.model, opt.learning_rate,
-               opt.weight_decay, opt.batch_size, opt.temp, opt.trial)
+               opt.weight_decay, opt.batch_size, opt.temp, opt.labeled_prob, 
+               opt.unlabeled_prob, opt.trial)
 
     if opt.cosine:
         opt.model_name = '{}_cosine'.format(opt.model_name)
@@ -136,8 +151,8 @@ def parse_option():
     return opt
 
 
-def set_loader(opt):
-    # construct data loader
+def set_dataset(opt):
+    # construct dataset
     if opt.dataset == 'cifar10':
         mean = (0.4914, 0.4822, 0.4465)
         std = (0.2023, 0.1994, 0.2010)
@@ -162,30 +177,50 @@ def set_loader(opt):
         normalize,
     ])
 
-    target_transform = lambda x: -1
-
     if opt.dataset == 'cifar10':
         train_dataset = datasets.CIFAR10(root=opt.data_folder,
                                          transform=TwoCropTransform(train_transform),
-                                         target_transform=target_transform,
                                          download=True)
     elif opt.dataset == 'cifar100':
         train_dataset = datasets.CIFAR100(root=opt.data_folder,
                                           transform=TwoCropTransform(train_transform),
-                                          target_transform=target_transform,
                                           download=True)
     elif opt.dataset == 'path':
         train_dataset = datasets.ImageFolder(root=opt.data_folder,
-                                            transform=TwoCropTransform(train_transform),
-                                            target_transform=target_transform)
+                                            transform=TwoCropTransform(train_transform))
     else:
         raise ValueError(opt.dataset)
 
-    train_sampler = None
-    train_loader = torch.utils.data.DataLoader(
-        train_dataset, batch_size=opt.batch_size, shuffle=(train_sampler is None),
-        num_workers=opt.num_workers, pin_memory=True, sampler=train_sampler)
+    return train_dataset
 
+
+def set_loader(opt):
+    train_dataset = set_dataset(opt)
+    
+    targets = train_dataset.targets
+    if torch.is_tensor(targets):
+        targets = targets.numpy()
+    elif type(targets) == list:
+        targets = np.array(targets)
+    
+    class_incremental = ClassIncremental(
+                                         targets, 
+                                         opt.labeled_prob, 
+                                         opt.unlabeled_prob, 
+                                         opt.nb_tasks
+                                        )
+
+    cl_dataset = ContinualDataset(
+                                  train_dataset, 
+                                  class_incremental.indexes, 
+                                  class_incremental.task_ids, 
+                                  class_incremental.keep_targets
+                                 )
+
+    train_loader = torch.utils.data.DataLoader(
+        cl_dataset, batch_size=opt.batch_size, shuffle=True,
+        num_workers=opt.num_workers, pin_memory=True)
+    
     return train_loader
 
 
@@ -221,7 +256,7 @@ def train(train_loader, model, classifier, criterions, optimizer, epoch, opt):
     losses = AverageMeter()
 
     end = time.time()
-    for idx, (images, labels) in enumerate(train_loader):
+    for idx, (images, labels, _) in enumerate(train_loader):
         data_time.update(time.time() - end)
 
         bsz = labels.shape[0]
@@ -295,10 +330,12 @@ def set_optimizer(opt, parameters):
 
 
 def main():
+    best_acc = 0
     opt = parse_option()
 
     # build data loader
     train_loader = set_loader(opt)
+    _, val_loader = set_val_loader(opt)
 
     # build model and criterion
     model, classifier, criterions = set_model(opt)
@@ -320,6 +357,12 @@ def main():
         time2 = time.time()
         print('epoch {}, total time {:.2f}'.format(epoch, time2 - time1))
 
+        # eval for one epoch
+        if epoch % opt.val_freq == 0 or epoch == opt.epochs:
+            loss, val_acc = validate(val_loader, model, classifier, criterions['CrossEntropyLoss'], opt)
+            if val_acc > best_acc:
+                best_acc = val_acc
+
         # tensorboard logger
         writer.add_scalar('loss', loss, global_step=epoch)
         writer.add_scalar('learning_rate', optimizer.param_groups[0]['lr'], global_step=epoch)
@@ -328,6 +371,8 @@ def main():
             save_file = os.path.join(
                 opt.save_folder, 'ckpt_epoch_{epoch}.pth'.format(epoch=epoch))
             save_model(model, optimizer, opt, epoch, save_file)
+
+    print('best accuracy: {:.2f}'.format(best_acc))
 
     # save the last model
     save_file = os.path.join(
