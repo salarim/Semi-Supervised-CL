@@ -21,6 +21,7 @@ from main_linear import validate
 from networks.resnet_big import SupConResNet, LinearClassifier
 from losses import SupConLoss
 from continual_dataset import ClassIncremental, ContinualDataset
+from memory import ReserviorMemory
 
 try:
     import apex
@@ -39,7 +40,9 @@ def parse_option():
     parser.add_argument('--val_freq', type=int, default=50,
                         help='validation frequency')
     parser.add_argument('--batch_size', type=int, default=256,
-                        help='batch_size')
+                        help='dataloader batch_size')
+    parser.add_argument('--training_batch_size', type=int, default=256,
+                        help='training batch_size')
     parser.add_argument('--num_workers', type=int, default=16,
                         help='num of workers to use')
     parser.add_argument('--epochs', type=int, default=1000,
@@ -75,8 +78,10 @@ def parse_option():
                         help='Probability of labeled data in dataset')
 
     # method
-    parser.add_argument('--method', type=str, default='SupCon',
-                        choices=['SupCon', 'SimCLR'], help='choose method')
+    parser.add_argument('--labeled_memory_capacity', type=int, default=1000, 
+                        help='The capacity of memory bank for labeled data')
+    parser.add_argument('--unlabeled_memory_capacity', type=int, default=1000, 
+                        help='The capacity of memory bank for unlabeled data')
 
     # temperature
     parser.add_argument('--temp', type=float, default=0.07,
@@ -111,16 +116,16 @@ def parse_option():
     for it in iterations:
         opt.lr_decay_epochs.append(int(it))
 
-    opt.model_name = '{}_{}_{}_lr_{}_decay_{}_bsz_{}_temp_{}_lprob_{}_unlprob_{}_trial_{}'.\
-        format(opt.method, opt.dataset, opt.model, opt.learning_rate,
-               opt.weight_decay, opt.batch_size, opt.temp, opt.labeled_prob, 
+    opt.model_name = '{}_{}_lr_{}_decay_{}_bsz_{}_tbsz_{}_temp_{}_lprob_{}_unlprob_{}_trial_{}'.\
+        format(opt.dataset, opt.model, opt.learning_rate, opt.weight_decay, 
+               opt.batch_size, opt.training_batch_size, opt.temp, opt.labeled_prob, 
                opt.unlabeled_prob, opt.trial)
 
     if opt.cosine:
         opt.model_name = '{}_cosine'.format(opt.model_name)
 
     # warm-up for large-batch training,
-    if opt.batch_size > 256:
+    if opt.training_batch_size > 256:
         opt.warm = True
     if opt.warm:
         opt.model_name = '{}_warm'.format(opt.model_name)
@@ -247,7 +252,37 @@ def set_model(opt):
     return model, classifier, criterions
 
 
-def train(train_loader, model, classifier, criterions, optimizer, epoch, opt):
+def divide_labeled_unlabeled(images, labels):
+    labeled_indexes = labels != -1
+    unlabeled_indexes = labels == -1
+
+    labeled_images_v1 = images[0][labeled_indexes]
+    labeled_images_v2 = images[1][labeled_indexes]
+    unlabeled_images_v1 = images[0][unlabeled_indexes]
+    unlabeled_images_v2 = images[1][unlabeled_indexes]
+
+    labeled_labels = labels[labeled_indexes]
+    unlabeled_labels = labels[unlabeled_indexes]
+
+    return [labeled_images_v1, labeled_images_v2, labeled_labels], \
+                [unlabeled_images_v1, unlabeled_images_v2, unlabeled_labels]
+
+
+def extend_by_memory(memory_bank, data, extended_size):
+    if data[0].shape[0] >= extended_size:
+        return data
+    
+    samples_size = extended_size - data[0].shape[0]
+    memorized_data = memory_bank.get_sample(samples_size)
+    
+    for i in range(len(data)):
+        if memorized_data[i] is not None:
+            data[i] = torch.cat([data[i], memorized_data[i]], dim=0)
+
+    return data
+
+
+def train(train_loader, memory_banks, model, classifier, criterions, optimizer, epoch, opt):
     """one epoch training"""
     model.train()
 
@@ -259,19 +294,39 @@ def train(train_loader, model, classifier, criterions, optimizer, epoch, opt):
     for idx, (images, labels, _) in enumerate(train_loader):
         data_time.update(time.time() - end)
 
-        bsz = labels.shape[0]
-        images = torch.cat([images[0], images[1]], dim=0)
-        labels = labels.repeat(2)
+        new_labeled_data, new_unlabeled_data = divide_labeled_unlabeled(images, labels)
+
+        # calculate bsz
+        labeled_bsz = new_labeled_data[0].shape[0]
+        unlabeled_bsz = new_unlabeled_data[0].shape[0]
+        bsz = labeled_bsz + unlabeled_bsz
+
+        # extend by memory
+        labeled_data = extend_by_memory( 
+                                        memory_banks['labeled'], 
+                                        new_labeled_data,
+                                        int(labeled_bsz * opt.training_batch_size / bsz)
+                                        )
+        unlabeled_data = extend_by_memory(
+                                          memory_banks['unlabeled'], 
+                                          new_unlabeled_data,
+                                          int(unlabeled_bsz * opt.training_batch_size / bsz)
+                                          )
+
+        # update bsz after extending
+        labeled_bsz = labeled_data[0].shape[0]
+        unlabeled_bsz = unlabeled_data[0].shape[0]
+        bsz = labeled_bsz + unlabeled_bsz
+
+        labeled_images = torch.cat([labeled_data[0], labeled_data[1]], dim=0)
+        labels = labeled_data[2].repeat(2)
+        unlabeled_images = torch.cat([unlabeled_data[0], unlabeled_data[1]], dim=0)
 
         if torch.cuda.is_available():
-            images = images.cuda(non_blocking=True)
+            labeled_images = labeled_images.cuda(non_blocking=True)
+            unlabeled_images = unlabeled_images.cuda(non_blocking=True)
             labels = labels.cuda(non_blocking=True)
-
-        labeled_images = images[labels != -1]
-        unlabeled_images = images[labels == -1]
-        labels = labels[labels != -1]
-        unlabeled_bsz = unlabeled_images.shape[0]
-        labeled_bsz = labeled_images.shape[0]
+        
 
         # warm-up learning rate
         warmup_learning_rate(opt, epoch, idx, len(train_loader), optimizer)
@@ -280,7 +335,7 @@ def train(train_loader, model, classifier, criterions, optimizer, epoch, opt):
         # compute unsupervised loss
         if unlabeled_bsz > 0:
             features = model(unlabeled_images)
-            f1, f2 = torch.split(features, [int(unlabeled_bsz/2), int(unlabeled_bsz/2)], dim=0)
+            f1, f2 = torch.split(features, [unlabeled_bsz, unlabeled_bsz], dim=0)
             features = torch.cat([f1.unsqueeze(1), f2.unsqueeze(1)], dim=1)
             unsup_loss = criterions['SupConLoss'](features)
             loss += unsup_loss * unlabeled_bsz
@@ -317,6 +372,10 @@ def train(train_loader, model, classifier, criterions, optimizer, epoch, opt):
                    epoch, idx + 1, len(train_loader), batch_time=batch_time,
                    data_time=data_time, loss=losses))
             sys.stdout.flush()
+            
+        # add current batch to memroy banks
+        memory_banks['labeled'].add(*new_labeled_data)
+        memory_banks['unlabeled'].add(*new_unlabeled_data)
 
     return losses.avg
 
@@ -346,6 +405,10 @@ def main():
 
     # tensorboard
     writer = SummaryWriter(log_dir=opt.tb_folder, flush_secs=2)
+    
+    # build memory banks
+    memory_banks = {'labeled': ReserviorMemory(opt.labeled_memory_capacity),
+            'unlabeled': ReserviorMemory(opt.unlabeled_memory_capacity)}
 
     # training routine
     for epoch in range(1, opt.epochs + 1):
@@ -353,7 +416,7 @@ def main():
 
         # train for one epoch
         time1 = time.time()
-        loss = train(train_loader, model, classifier, criterions, optimizer, epoch, opt)
+        loss = train(train_loader, memory_banks, model, classifier, criterions, optimizer, epoch, opt)
         time2 = time.time()
         print('epoch {}, total time {:.2f}'.format(epoch, time2 - time1))
 
