@@ -2,7 +2,7 @@
 #SBATCH --mail-user=salari.m1375@gmail.com
 #SBATCH --mail-type=ALL
 #SBATCH --account=def-mori_gpu
-#SBATCH --job-name=SSCL-cl-dataset-semisup-test
+#SBATCH --job-name=SSCL-semisup-bsz-256-tbsz-512
 #SBATCH --output=%x-%j.out
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
@@ -25,7 +25,8 @@ pip install --no-index -r requirements.txt
 python main_semicl.py \
   --model resnet50 \
   --epochs 1000 \
-  --batch_size 512 \
+  --batch_size 256 \
+  --training_batch_size 512 \
   --learning_rate 0.5 \
   --temp 0.5 \
   --cosine \
