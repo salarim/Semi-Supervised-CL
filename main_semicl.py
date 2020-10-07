@@ -70,6 +70,8 @@ def parse_option():
     parser.add_argument('--std', type=str, help='std of dataset in path in form of str tuple')
     parser.add_argument('--data_folder', type=str, default=None, help='path to custom dataset')
     parser.add_argument('--size', type=int, default=32, help='parameter for RandomResizedCrop')
+    parser.add_argument('--shuffle', action='store_true',
+                        help='Shuffle dataloader')
 
     # continual dataset
     parser.add_argument('--nb_tasks', type=int, default=5, 
@@ -224,7 +226,7 @@ def set_loader(opt):
                                  )
 
     train_loader = torch.utils.data.DataLoader(
-        cl_dataset, batch_size=opt.batch_size, shuffle=False,
+        cl_dataset, batch_size=opt.batch_size, shuffle=opt.shuffle,
         num_workers=opt.num_workers, pin_memory=True)
     
     return train_loader
