@@ -47,6 +47,8 @@ def parse_option():
                         help='num of workers to use')
     parser.add_argument('--epochs', type=int, default=1000,
                         help='number of training epochs')
+    parser.add_argument('--updates_per_batch', type=int, default=1,
+                        help='number of training iterations per batch')
 
     # optimization
     parser.add_argument('--learning_rate', type=float, default=0.05,
@@ -124,9 +126,6 @@ def parse_option():
     if opt.cosine:
         opt.model_name = '{}_cosine'.format(opt.model_name)
 
-    # warm-up for large-batch training,
-    if opt.training_batch_size > 256:
-        opt.warm = True
     if opt.warm:
         opt.model_name = '{}_warm'.format(opt.model_name)
         opt.warmup_from = 0.01
@@ -295,69 +294,70 @@ def train(train_loader, memory_banks, model, classifier, criterions, optimizer, 
         data_time.update(time.time() - end)
 
         new_labeled_data, new_unlabeled_data = divide_labeled_unlabeled(images, labels)
-
-        # calculate bsz
-        labeled_bsz = new_labeled_data[0].shape[0]
-        unlabeled_bsz = new_unlabeled_data[0].shape[0]
-        bsz = labeled_bsz + unlabeled_bsz
-
-        # extend by memory
-        labeled_data = extend_by_memory( 
-                                        memory_banks['labeled'], 
-                                        new_labeled_data,
-                                        int(labeled_bsz * opt.training_batch_size / bsz)
-                                        )
-        unlabeled_data = extend_by_memory(
-                                          memory_banks['unlabeled'], 
-                                          new_unlabeled_data,
-                                          int(unlabeled_bsz * opt.training_batch_size / bsz)
-                                          )
-
-        # update bsz after extending
-        labeled_bsz = labeled_data[0].shape[0]
-        unlabeled_bsz = unlabeled_data[0].shape[0]
-        bsz = labeled_bsz + unlabeled_bsz
-
-        labeled_images = torch.cat([labeled_data[0], labeled_data[1]], dim=0)
-        labels = labeled_data[2].repeat(2)
-        unlabeled_images = torch.cat([unlabeled_data[0], unlabeled_data[1]], dim=0)
-
-        if torch.cuda.is_available():
-            labeled_images = labeled_images.cuda(non_blocking=True)
-            unlabeled_images = unlabeled_images.cuda(non_blocking=True)
-            labels = labels.cuda(non_blocking=True)
         
+        for pass_idx in range(opt.updates_per_batch):
+            # calculate bsz
+            labeled_bsz = new_labeled_data[0].shape[0]
+            unlabeled_bsz = new_unlabeled_data[0].shape[0]
+            bsz = labeled_bsz + unlabeled_bsz
 
-        # warm-up learning rate
-        warmup_learning_rate(opt, epoch, idx, len(train_loader), optimizer)
+            # extend by memory
+            labeled_data = extend_by_memory( 
+                                            memory_banks['labeled'], 
+                                            new_labeled_data,
+                                            int(labeled_bsz * opt.training_batch_size / bsz)
+                                            )
+            unlabeled_data = extend_by_memory(
+                                            memory_banks['unlabeled'], 
+                                            new_unlabeled_data,
+                                            int(unlabeled_bsz * opt.training_batch_size / bsz)
+                                            )
 
-        loss = 0.0
-        # compute unsupervised loss
-        if unlabeled_bsz > 0:
-            features = model(unlabeled_images)
-            f1, f2 = torch.split(features, [unlabeled_bsz, unlabeled_bsz], dim=0)
-            features = torch.cat([f1.unsqueeze(1), f2.unsqueeze(1)], dim=1)
-            unsup_loss = criterions['SupConLoss'](features)
-            loss += unsup_loss * unlabeled_bsz
+            # update bsz after extending
+            labeled_bsz = labeled_data[0].shape[0]
+            unlabeled_bsz = unlabeled_data[0].shape[0]
+            bsz = labeled_bsz + unlabeled_bsz
 
-        # compute supervised loss
-        if labeled_bsz > 0:
-            with torch.no_grad():
-                features = model.encoder(labeled_images)
-            output = classifier(features.detach())
-            sup_loss = criterions['CrossEntropyLoss'](output, labels)
-            loss += sup_loss * labeled_bsz  
-        
-        # take average of loss
-        loss = loss / (unlabeled_bsz + labeled_bsz)
+            labeled_images = torch.cat([labeled_data[0], labeled_data[1]], dim=0)
+            labels = labeled_data[2].repeat(2)
+            unlabeled_images = torch.cat([unlabeled_data[0], unlabeled_data[1]], dim=0)
 
-        # update metric
-        losses.update(loss.item(), bsz)
+            if torch.cuda.is_available():
+                labeled_images = labeled_images.cuda(non_blocking=True)
+                unlabeled_images = unlabeled_images.cuda(non_blocking=True)
+                labels = labels.cuda(non_blocking=True)
+            
 
-        # SGD
-        optimizer.zero_grad()
-        loss.backward()
-        optimizer.step()
+            # warm-up learning rate
+            warmup_learning_rate(opt, epoch, idx, len(train_loader), optimizer)
+
+            loss = 0.0
+            # compute unsupervised loss
+            if unlabeled_bsz > 0:
+                features = model(unlabeled_images)
+                f1, f2 = torch.split(features, [unlabeled_bsz, unlabeled_bsz], dim=0)
+                features = torch.cat([f1.unsqueeze(1), f2.unsqueeze(1)], dim=1)
+                unsup_loss = criterions['SupConLoss'](features)
+                loss += unsup_loss * unlabeled_bsz
+
+            # compute supervised loss
+            if labeled_bsz > 0:
+                with torch.no_grad():
+                    features = model.encoder(labeled_images)
+                output = classifier(features.detach())
+                sup_loss = criterions['CrossEntropyLoss'](output, labels)
+                loss += sup_loss * labeled_bsz  
+            
+            # take average of loss
+            loss = loss / (unlabeled_bsz + labeled_bsz)
+
+            # update metric
+            losses.update(loss.item(), bsz)
+
+            # SGD
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
 
         # measure elapsed time
         batch_time.update(time.time() - end)
