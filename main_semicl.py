@@ -84,6 +84,8 @@ def parse_option():
                         help='The capacity of memory bank for labeled data')
     parser.add_argument('--unlabeled_memory_capacity', type=int, default=1000, 
                         help='The capacity of memory bank for unlabeled data')
+    parser.add_argument('--supervised_backbone_update', action='store_true',
+                        help='update backbone of networks using labeled data')
 
     # temperature
     parser.add_argument('--temp', type=float, default=0.07,
@@ -342,9 +344,13 @@ def train(train_loader, memory_banks, model, classifier, criterions, optimizer, 
 
             # compute supervised loss
             if labeled_bsz > 0:
-                with torch.no_grad():
+                if opt.supervised_backbone_update:
                     features = model.encoder(labeled_images)
-                output = classifier(features.detach())
+                    output = classifier(features)
+                else:
+                    with torch.no_grad():
+                        features = model.encoder(labeled_images)
+                    output = classifier(features.detach())
                 sup_loss = criterions['CrossEntropyLoss'](output, labels)
                 loss += sup_loss * labeled_bsz  
             
