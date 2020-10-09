@@ -14,7 +14,6 @@ import torch.backends.cudnn as cudnn
 from torchvision import transforms, datasets
 
 from util import TwoCropTransform, AverageMeter
-from util import adjust_learning_rate, warmup_learning_rate
 from util import save_model
 from main_ce import set_loader as set_val_loader
 from main_linear import validate
@@ -100,6 +99,8 @@ def parse_option():
                         help='using synchronized batch normalization')
     parser.add_argument('--warm', action='store_true',
                         help='warm-up for large batch training')
+    parser.add_argument('--warm_epochs', type=float, default=10.0,
+                        help='Warmup epochs')
     parser.add_argument('--trial', type=str, default='0',
                         help='id for recording multiple runs')
 
@@ -133,7 +134,6 @@ def parse_option():
     if opt.warm:
         opt.model_name = '{}_warm'.format(opt.model_name)
         opt.warmup_from = 0.01
-        opt.warm_epochs = 10
         if opt.cosine:
             eta_min = opt.learning_rate * (opt.lr_decay_rate ** 3)
             opt.warmup_to = eta_min + (opt.learning_rate - eta_min) * (
@@ -332,8 +332,9 @@ def train(train_loader, memory_banks, model, classifier, criterions, optimizer, 
                 labels = labels.cuda(non_blocking=True)
             
 
-            # warm-up learning rate
-            warmup_learning_rate(opt, epoch, idx, len(train_loader), optimizer)
+            # adjust learning rate
+            adjust_learning_rate(opt, optimizer, epoch, idx, len(train_loader), pass_idx)
+            warmup_learning_rate(opt, optimizer, epoch, idx, len(train_loader), pass_idx)
 
             loss = 0.0
             # compute unsupervised loss
@@ -388,6 +389,43 @@ def train(train_loader, memory_banks, model, classifier, criterions, optimizer, 
     return losses.avg
 
 
+def get_number_of_updates(epoch, batch_id, total_batches, update_id, updates_per_batch):
+    updates_per_epoch = total_batches * updates_per_batch
+
+    nb_updates = (epoch-1) * updates_per_epoch + batch_id * updates_per_batch + update_id
+
+    return nb_updates
+
+
+def adjust_learning_rate(args, optimizer, epoch, batch_id, total_batches, update_id):
+    nb_updates = get_number_of_updates(epoch, batch_id, total_batches, update_id, args.updates_per_batch)
+    total_nb_updates = get_number_of_updates(args.epochs+1, 0, total_batches, 0, args.updates_per_batch)
+
+    lr = args.learning_rate
+    if args.cosine:
+        eta_min = lr * (args.lr_decay_rate ** 3)
+        lr = eta_min + (lr - eta_min) * (
+                1 + math.cos(math.pi * nb_updates / total_nb_updates)) / 2
+    else:
+        steps = np.sum(epoch > np.asarray(args.lr_decay_epochs))
+        if steps > 0:
+            lr = lr * (args.lr_decay_rate ** steps)
+
+    for param_group in optimizer.param_groups:
+        param_group['lr'] = lr
+
+
+def warmup_learning_rate(args, optimizer, epoch, batch_id, total_batches, update_id):
+    nb_updates = get_number_of_updates(epoch, batch_id, total_batches, update_id, args.updates_per_batch)
+    warmup_nb_updates = get_number_of_updates(args.warm_epochs+1, 0, total_batches, 0, args.updates_per_batch)
+
+    if args.warm and nb_updates <= warmup_nb_updates:
+        p = nb_updates / warmup_nb_updates
+        lr = args.warmup_from + p * (args.warmup_to - args.warmup_from)
+
+        for param_group in optimizer.param_groups:
+            param_group['lr'] = lr
+
 def set_optimizer(opt, parameters):
     optimizer = optim.SGD(parameters,
                           lr=opt.learning_rate,
@@ -420,7 +458,6 @@ def main():
 
     # training routine
     for epoch in range(1, opt.epochs + 1):
-        adjust_learning_rate(opt, optimizer, epoch)
 
         # train for one epoch
         time1 = time.time()
